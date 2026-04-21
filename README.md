@@ -4,9 +4,6 @@ AI Document Organizer is an intelligent document management system that helps us
 
 In addition to traditional files, the system also supports saving shared links (such as ChatGPT conversations or online articles) as structured notes, making them searchable and usable alongside uploaded documents.
 
----
-# aiorganizer
-
 ## Overview
 
 Students and professionals often store large numbers of documents in messy, inconsistent folder structures. Important information becomes difficult to find, and searching manually through documents is time-consuming. This application solves that problem by combining document parsing, semantic search, and AI-powered summarization into a single workflow.
@@ -21,6 +18,7 @@ The system can:
 - provide references from stored documents and links
 
 ---
+# aiorganizer
 
 ## Problem
 
