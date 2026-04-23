@@ -21,6 +21,16 @@ const EMBEDDING_BATCH_SIZE = 64;
 const FOLDER_MATCH_THRESHOLD = 0.6;
 const LLM_DECISION_MODEL = "gpt-4o-mini";
 
+// DEBUG: upload + foldering pipeline logs (client console). Keep off in production.
+const DEBUG_UPLOAD_LOGS = process.env.NODE_ENV !== "production";
+
+// DEBUG: wrapper so we can easily grep console output.
+function debugUpload(...args) {
+  if (!DEBUG_UPLOAD_LOGS) return;
+  // eslint-disable-next-line no-console
+  console.debug("[ai-organizer][upload]", ...args);
+}
+
 function createId(prefix) {
   if (typeof crypto !== "undefined" && crypto.randomUUID) {
     return `${prefix}_${crypto.randomUUID()}`;
@@ -123,6 +133,36 @@ function formatBytes(value) {
   const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
   const amount = value / 1024 ** index;
   return `${amount.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function excerptForQuery(text, query, maxChars = 140) {
+  const source = String(text || "").replace(/\s+/g, " ").trim();
+  if (!source) return "";
+  if (!query?.trim()) return source.slice(0, maxChars);
+  if (source.length <= maxChars) return source;
+
+  const normalizedSource = source.toLowerCase();
+  const tokens = String(query)
+    .toLowerCase()
+    .split(/\s+/)
+    .map((token) => token.replace(/[^a-z0-9_-]+/g, ""))
+    .filter((token) => token.length >= 3);
+
+  let matchIndex = -1;
+  for (const token of tokens) {
+    const index = normalizedSource.indexOf(token);
+    if (index !== -1 && (matchIndex === -1 || index < matchIndex)) {
+      matchIndex = index;
+    }
+  }
+
+  const windowStart = matchIndex === -1 ? 0 : Math.max(0, matchIndex - Math.floor(maxChars * 0.25));
+  const windowEnd = Math.min(source.length, windowStart + maxChars);
+  let excerpt = source.slice(windowStart, windowEnd);
+
+  if (windowStart > 0) excerpt = `…${excerpt}`;
+  if (windowEnd < source.length) excerpt = `${excerpt}…`;
+  return excerpt;
 }
 
 function chunkPlainText(text, maxChars = 1800) {
@@ -548,6 +588,7 @@ export default function Home() {
   }
 
   async function ensureFolderProfiles(liveDb) {
+    debugUpload("folder profiles: ensure start", { folder_count: realFolders.length });
     const profiles = [];
     const foldersToProfile = realFolders;
 
@@ -563,6 +604,10 @@ export default function Home() {
       });
 
       if (changedInputs.length) {
+        debugUpload("folder profiles: embedding batch", {
+          batch_size: batch.length,
+          changed: changedInputs.length
+        });
         const payload = await createEmbeddings(changedInputs.map((entry) => entry.profileText));
         const now = timestamp();
         const records = changedInputs.map(({ folder, profileText }, embeddingIndex) => {
@@ -604,6 +649,7 @@ export default function Home() {
       });
     }
 
+    debugUpload("folder profiles: ensure done", { profile_count: profiles.length });
     return profiles;
   }
 
@@ -642,6 +688,11 @@ export default function Home() {
     for (let offset = 0; offset < embeddableChunks.length; offset += EMBEDDING_BATCH_SIZE) {
       const batch = embeddableChunks.slice(offset, offset + EMBEDDING_BATCH_SIZE);
       reportStatus(`Embedding ${offset + 1}-${offset + batch.length} of ${embeddableChunks.length} chunks...`);
+      debugUpload("embeddings: chunk batch", {
+        offset,
+        batch: batch.length,
+        total: embeddableChunks.length
+      });
 
       const payload = await createEmbeddings(batch.map((chunk) => chunk.text));
       const now = timestamp();
@@ -686,7 +737,22 @@ export default function Home() {
     const best = rankedProfiles[0] || null;
     const eligibleMatches = rankedProfiles.filter((result) => result.score >= FOLDER_MATCH_THRESHOLD);
 
+    debugUpload("folder decision: similarity ranked", {
+      item_id: item.id,
+      title: item.title,
+      threshold: FOLDER_MATCH_THRESHOLD,
+      top: rankedProfiles.slice(0, 5).map((result) => ({
+        folder: result.folder.name,
+        score: Math.round(result.score * 1000) / 1000
+      }))
+    });
+
     if (eligibleMatches.length) {
+      debugUpload("folder decision: similarity matched", {
+        item_id: item.id,
+        matched_folders: eligibleMatches.map((match) => match.folder.name),
+        best_score: best ? Math.round(best.score * 1000) / 1000 : 0
+      });
       return assignItemToFinalFolders(liveDb, item, eligibleMatches.map((match) => match.folder), {
         decision_source: "embedding_similarity",
         similarity_score: best.score,
@@ -700,6 +766,15 @@ export default function Home() {
         reason: `${eligibleMatches.length} folder profile${eligibleMatches.length === 1 ? "" : "s"} met threshold ${(FOLDER_MATCH_THRESHOLD * 100).toFixed(0)}%.`
       }, itemChunks);
     }
+
+    debugUpload("folder decision: fallback to LLM", {
+      item_id: item.id,
+      candidate_count: rankedProfiles.length,
+      candidates: rankedProfiles.slice(0, 20).map((result) => ({
+        folder: result.folder.name,
+        score: Math.round(result.score * 1000) / 1000
+      }))
+    });
 
     const decision = await askLLMForFolderDecision({
       item: {
@@ -722,6 +797,14 @@ export default function Home() {
       threshold: FOLDER_MATCH_THRESHOLD
     });
 
+    debugUpload("folder decision: LLM response", {
+      item_id: item.id,
+      action: decision.action,
+      folder_id: decision.folder_id,
+      new_folder_name: decision.new_folder_name,
+      confidence: decision.confidence
+    });
+
     const selectedFolder = decision.action === "assign_existing"
       ? folderById(decision.folder_id)
       : null;
@@ -732,6 +815,15 @@ export default function Home() {
     const existingNamedFolder = realFolders.find(
       (folder) => folder.name.toLowerCase() === requestedFolderName.toLowerCase()
     );
+    debugUpload("folder decision: resolve folder", {
+      item_id: item.id,
+      requested_name: requestedFolderName,
+      resolved: selectedFolder
+        ? { source: "llm_existing_id", folder: selectedFolder.name, folder_id: selectedFolder.id }
+        : existingNamedFolder
+          ? { source: "llm_existing_name", folder: existingNamedFolder.name, folder_id: existingNamedFolder.id }
+          : { source: "llm_new_folder" }
+    });
     const folder = selectedFolder || existingNamedFolder || await createFolderRecord(
       requestedFolderName,
       decision.new_folder_description || "Created by LLM folder decisioning.",
@@ -865,6 +957,13 @@ export default function Home() {
       throw new Error("At least one folder is required for folder assignment.");
     }
 
+    debugUpload("folder assignment: start", {
+      item_id: item.id,
+      title: item.title,
+      decision_source: decision.decision_source,
+      folders: uniqueFolders.map((folder) => folder.name)
+    });
+
     const stagingRelations = data.folderItems.filter(
       (row) => row.item_id === item.id && row.assignment_type === LEGACY_DEVELOPMENT_ASSIGNMENT_TYPE
     );
@@ -917,6 +1016,11 @@ export default function Home() {
     }
 
     setSelectedFolderId(primaryFolder.id);
+    debugUpload("folder assignment: done", {
+      item_id: item.id,
+      primary_folder: primaryFolder.name,
+      folders: uniqueFolders.map((folder) => folder.name)
+    });
     return updatedItem;
   }
 
@@ -934,9 +1038,23 @@ export default function Home() {
       const payload = await createEmbeddings(trimmedQuery);
       const queryEmbedding = payload.embeddings[0];
       try {
-        const pgResults = await searchPgvector(queryEmbedding, 5);
+        const pgResults = await searchPgvector(queryEmbedding, 20);
+        const bestByItemId = new Map();
+        pgResults.forEach((result) => {
+          const itemId = result.item_id || result.source_id || "";
+          const score = Number(result.score) || 0;
+          const existing = itemId ? bestByItemId.get(itemId) : null;
+          if (!itemId) return;
+          if (!existing || score > (Number(existing.score) || 0)) {
+            bestByItemId.set(itemId, { ...result, score });
+          }
+        });
+        const uniqueResults = [...bestByItemId.values()]
+          .sort((left, right) => (Number(right.score) || 0) - (Number(left.score) || 0))
+          .slice(0, 5);
+
         setQueryResults(
-          pgResults.map((result) => ({
+          uniqueResults.map((result) => ({
             chunk: result,
             item: itemById(result.item_id) || {
               id: result.item_id || result.source_id,
@@ -956,7 +1074,7 @@ export default function Home() {
       }
 
       if (!embeddedChunks.length) {
-        setQueryError("No embedded chunks yet. Embed pending chunks from Manage first.");
+        setQueryError("No embedded files yet. Add and embed items from Manage first.");
         return;
       }
 
@@ -968,10 +1086,17 @@ export default function Home() {
           score: cosineSimilarity(queryEmbedding, chunk.embedding)
         }))
         .filter((result) => result.item)
-        .sort((left, right) => right.score - left.score)
-        .slice(0, 5);
+        .sort((left, right) => right.score - left.score);
 
-      setQueryResults(rankedResults);
+      const bestByItemId = new Map();
+      rankedResults.forEach((result) => {
+        const itemId = result.item.id;
+        if (!bestByItemId.has(itemId)) {
+          bestByItemId.set(itemId, result);
+        }
+      });
+
+      setQueryResults([...bestByItemId.values()].slice(0, 5));
     } catch (error) {
       setQueryError(error.message || "Semantic search failed.");
     } finally {
@@ -1050,8 +1175,24 @@ export default function Home() {
 
     setItemSaving(true);
     try {
+      debugUpload("upload: start", {
+        type: itemType,
+        title,
+        file_name: itemFile?.name || "",
+        file_size: itemFile?.size || 0
+      });
+
       setItemStatus(itemType === "file" ? "Parsing with Docling..." : "Preparing note...");
       const parsedDocument = itemType === "file" ? await parseFileWithDocling(itemFile) : parseNoteContent(content);
+      debugUpload("upload: parsed", {
+        type: itemType,
+        title,
+        parser: parsedDocument.parser || "unknown",
+        source_type: parsedDocument.source_type || itemType,
+        chunk_count: parsedDocument.chunks?.length || 0,
+        text_chars: String(parsedDocument.text || content || "").length
+      });
+
       const now = timestamp();
       const itemId = createId("item");
       const localFileId = itemType === "file" ? createId("local_file") : "";
@@ -1112,8 +1253,20 @@ export default function Home() {
         });
       }
       const chunkRecords = await saveDocumentChunks(liveDb, parsedItem, parsedDocument.chunks || [], now);
+      debugUpload("upload: chunks saved", {
+        item_id: parsedItem.id,
+        chunks: chunkRecords.length
+      });
       const embeddedChunksForItem = await embedChunkRecords(liveDb, chunkRecords, setItemStatus);
+      debugUpload("upload: chunks embedded", {
+        item_id: parsedItem.id,
+        embedded: embeddedChunksForItem.filter((chunk) => chunk.embedding_status === "embedded").length
+      });
       const embeddedItem = await markItemEmbedded(liveDb, parsedItem, embeddedChunksForItem);
+      debugUpload("upload: item embedded", {
+        item_id: embeddedItem.id,
+        embedded_chunk_count: embeddedItem.embedded_chunk_count
+      });
       setVectorError("");
       try {
         await syncPgvector({
@@ -1127,7 +1280,9 @@ export default function Home() {
       }
 
       setItemStatus("Deciding folder...");
+      debugUpload("upload: folder decision start", { item_id: embeddedItem.id, threshold: FOLDER_MATCH_THRESHOLD });
       await decideFolderForEmbeddedItem(liveDb, embeddedItem, embeddedChunksForItem);
+      debugUpload("upload: done", { item_id: embeddedItem.id });
       setItemTitle("");
       setItemContent("");
       setItemFile(null);
@@ -1350,21 +1505,21 @@ export default function Home() {
               <p className="eyebrow">Semantic retrieval</p>
               <p>{querySearching ? "Searching embedded chunks..." : `Top matches for "${submittedQuery}"`}</p>
               <div className="reference-block">
-                <h2>Relevant chunks</h2>
+                <h2>Relevant files</h2>
                 {queryResults.length ? (
                   <div className="reference-list">
                     {queryResults.map(({ chunk, item, folderName, score }) => (
                       <article className="reference-card" key={chunk.id}>
-                        <div>
-                          <h3>{item.title}</h3>
-                          <p>
-                            {folderName || folderNameForItem(item.id)} · {(score * 100).toFixed(1)}% match
-                          </p>
-                          <p>{chunk.text.slice(0, 220)}</p>
-                        </div>
-                        <LocalFilePreview fileCopy={fileCopyForItem(item)} />
-                      </article>
-                    ))}
+	                        <div>
+	                          <h3>{item.title}</h3>
+	                          <p>
+	                            {folderName || folderNameForItem(item.id)} · {(score * 100).toFixed(1)}% match
+	                          </p>
+	                          <p>{excerptForQuery(chunk.text, submittedQuery, 140)}</p>
+	                        </div>
+	                        <LocalFilePreview fileCopy={fileCopyForItem(item)} />
+	                      </article>
+	                    ))}
                   </div>
                 ) : (
                   <p className="muted-copy">
@@ -1410,7 +1565,7 @@ export default function Home() {
               <label>
                 <span>Title</span>
                 <input
-                  placeholder="machine-learning-slides.pdf"
+                  placeholder="Topic_Date.pdf"
                   value={itemTitle}
                   onChange={(event) => setItemTitle(event.target.value)}
                 />

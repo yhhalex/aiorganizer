@@ -1,6 +1,14 @@
 export const runtime = "nodejs";
-
 const DEFAULT_MODEL = "gpt-4o-mini";
+
+// DEBUG: server-side logging for LLM folder decisioning.
+const DEBUG_LLM_FOLDER_LOGS = false;
+
+function debugFolderDecision(...args) {
+  if (!DEBUG_LLM_FOLDER_LOGS) return;
+  // eslint-disable-next-line no-console
+  console.debug("[ai-organizer][folder-decision]", ...args);
+}
 
 const decisionSchema = {
   type: "object",
@@ -105,6 +113,14 @@ export async function POST(request) {
     const threshold = Number(body.threshold || 0.6);
     const model = body.model || DEFAULT_MODEL;
 
+    debugFolderDecision("request", {
+      model,
+      threshold,
+      candidate_count: candidates.length,
+      title: String(item.title || ""),
+      source_type: String(item.source_type || "")
+    });
+
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
@@ -174,6 +190,7 @@ export async function POST(request) {
 
     const refusal = extractRefusal(payload);
     if (refusal) {
+      debugFolderDecision("refusal", { refusal });
       return Response.json(
         { ok: false, error: `Folder decision model refused: ${refusal}` },
         { status: 422 }
@@ -189,6 +206,7 @@ export async function POST(request) {
         decision = JSON.parse(extracted.value);
       } catch (error) {
         const preview = extracted.value ? extracted.value.slice(0, 240) : "";
+        debugFolderDecision("parse_error", { message: error.message, preview });
         return Response.json(
           {
             ok: false,
@@ -202,6 +220,13 @@ export async function POST(request) {
         );
       }
     }
+
+    debugFolderDecision("response", {
+      action: decision?.action,
+      folder_id: decision?.folder_id,
+      new_folder_name: decision?.new_folder_name,
+      confidence: decision?.confidence
+    });
 
     return Response.json({
       ok: true,

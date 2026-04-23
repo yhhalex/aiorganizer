@@ -264,6 +264,17 @@ h3 {
   background: var(--panel-raised);
 }
 
+.reference-card > div {
+  flex: 1;
+  min-width: 0;
+}
+
+.reference-card .preview-link {
+  flex-shrink: 0;
+  margin-top: 0;
+  white-space: nowrap;
+}
+
 .reference-card h3 {
   overflow-wrap: anywhere;
 }
