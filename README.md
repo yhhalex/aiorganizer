@@ -227,6 +227,79 @@ Example stack:
 
 ---
 
+## Local Document Parsing
+
+The prototype parses uploaded `pdf`, `docx`, `pptx`, and `md` files through a Next.js API route backed by Docling. The parser converts each file to Markdown, plain text, and chunk records that feed directly into embeddings and folder decisioning.
+
+Install the Python parser dependency with Python 3.10+:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+If your Docling install lives in a non-default Python runtime, start Next with `DOCLING_PYTHON=/path/to/python`.
+
+PDF parsing uses Docling's PDF pipeline. For offline PDF parsing, prefetch Docling's model artifacts with `docling-tools models download` and set `DOCLING_ARTIFACTS_PATH` if you store them outside Docling's default cache.
+
+---
+
+## Local Embedding Stage
+
+Parsed chunks can be embedded through the server-side `/api/embed` route. The route calls OpenAI's embeddings API with `text-embedding-3-small`, returns float vectors, and keeps the API key out of browser code.
+
+Set the key before running the app:
+
+```bash
+OPENAI_API_KEY=your_key npm run dev
+```
+
+Embeddings are stored locally on `document_chunks` records and mirrored to pgvector when `DATABASE_URL` is configured.
+
+---
+
+## Local pgvector Stage
+
+The prototype includes a Postgres + pgvector setup for durable vector search. IndexedDB still drives the local UI state, while `/api/vector/upsert` mirrors sources, folders, folder assignments, chunks, and embeddings into Postgres. The Ask view tries `/api/vector/search` first and falls back to local IndexedDB vector search if pgvector is unavailable.
+
+Start the local database:
+
+```bash
+docker compose up -d
+```
+
+Run the schema migration:
+
+```bash
+npm run db:migrate
+```
+
+Use the default local URL:
+
+```bash
+DATABASE_URL=postgres://aiorganizer:aiorganizer@127.0.0.1:55432/aiorganizer
+```
+
+The schema stores `sources`, `folders`, `folder_items`, `document_chunks`, and `folder_profiles`. Chunk and folder-profile embeddings use `vector(1536)` with HNSW cosine indexes for nearest-neighbor search.
+
+---
+
+## Folder Decisioning
+
+After parsing and embedding, files are assigned with embedding similarity first and LLM decisioning second. New uploads now run through this path automatically instead of being staged in a temporary testing folder.
+
+The upload flow and the Manage view's `Decide` action both:
+
+1. Builds folder profiles from folder names, descriptions, assigned item titles, and representative chunk text.
+2. Embeds those folder profiles.
+3. Averages the new file's chunk embeddings into a document vector.
+4. Compares the document vector and individual chunk vectors against folder-profile vectors.
+5. Assigns directly to every existing folder whose similarity is at least `0.75`.
+6. Calls the LLM only when no existing folder clears the threshold, asking whether to assign to a candidate folder or create a new folder.
+
+The LLM endpoint is `/api/llm/folder-decision`. It returns a structured decision with `action`, `folder_id`, `new_folder_name`, `confidence`, and `reason`.
+
+---
+
 ## Future Improvements
 
 Potential extensions include:
