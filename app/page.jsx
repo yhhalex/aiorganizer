@@ -3,8 +3,23 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const DB_NAME = "ai-organizer-prototype";
-const DB_VERSION = 2;
-const STORE_NAMES = ["folders", "items", "folder_items", "folder_suggestions", "local_files"];
+const DB_VERSION = 4;
+const STORE_NAMES = [
+  "folders",
+  "items",
+  "folder_items",
+  "folder_suggestions",
+  "local_files",
+  "document_chunks",
+  "folder_profiles"
+];
+const LEGACY_DEVELOPMENT_TESTING_FOLDER_NAME = "development_testing_folder";
+const LEGACY_DEVELOPMENT_ASSIGNMENT_TYPE = "development_testing";
+const EMBEDDING_MODEL = "text-embedding-3-small";
+const EMBEDDING_DIMENSIONS = 1536;
+const EMBEDDING_BATCH_SIZE = 64;
+const FOLDER_MATCH_THRESHOLD = 0.6;
+const LLM_DECISION_MODEL = "gpt-4o-mini";
 
 function createId(prefix) {
   if (typeof crypto !== "undefined" && crypto.randomUUID) {
@@ -50,6 +65,17 @@ function openDatabase() {
         const store = db.createObjectStore("local_files", { keyPath: "id" });
         store.createIndex("item_id", "item_id", { unique: false });
         store.createIndex("file_name", "file_name", { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains("document_chunks")) {
+        const store = db.createObjectStore("document_chunks", { keyPath: "id" });
+        store.createIndex("item_id", "item_id", { unique: false });
+        store.createIndex("embedding_status", "embedding_status", { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains("folder_profiles")) {
+        const store = db.createObjectStore("folder_profiles", { keyPath: "id" });
+        store.createIndex("folder_id", "folder_id", { unique: false });
       }
     };
 
@@ -99,22 +125,207 @@ function formatBytes(value) {
   return `${amount.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
-function findSuggestionMatch(title) {
-  const value = title.toLowerCase();
+function chunkPlainText(text, maxChars = 1800) {
+  const normalized = text.replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  if (!normalized) return [];
 
-  if (value.includes("database")) {
-    return { folderName: "Databases", reason: 'Filename contains "database".' };
+  const paragraphs = normalized.split(/\n\s*\n/).map((paragraph) => paragraph.trim()).filter(Boolean);
+  const chunks = [];
+  let current = "";
+
+  paragraphs.forEach((paragraph) => {
+    if (current && current.length + paragraph.length + 2 > maxChars) {
+      chunks.push(current);
+      current = paragraph;
+      return;
+    }
+
+    current = [current, paragraph].filter(Boolean).join("\n\n");
+  });
+
+  if (current) chunks.push(current);
+
+  return chunks.map((chunk, index) => ({
+    index,
+    heading: "Note",
+    markdown: chunk,
+    text: chunk,
+    char_count: chunk.length
+  }));
+}
+
+function parseNoteContent(content) {
+  const text = content.trim();
+  const chunks = chunkPlainText(text);
+  return {
+    parser: "plain-text",
+    source_type: "note",
+    markdown: text,
+    text,
+    chunks,
+    metadata: {
+      chunk_count: chunks.length,
+      char_count: text.length
+    }
+  };
+}
+
+async function parseFileWithDocling(file) {
+  const formData = new FormData();
+  formData.append("file", file);
+
+  const response = await fetch("/api/parse", {
+    method: "POST",
+    body: formData
+  });
+  const payload = await response.json().catch(() => ({}));
+
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || "File could not be parsed.");
   }
 
-  if (value.includes("machine-learning") || value.includes("machine learning") || /\bml\b/.test(value)) {
-    return { folderName: "Machine Learning", reason: "Filename contains a machine learning keyword." };
+  return payload;
+}
+
+async function createEmbeddings(input) {
+  const response = await fetch("/api/embed", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      input,
+      model: EMBEDDING_MODEL,
+      dimensions: EMBEDDING_DIMENSIONS
+    })
+  });
+  const payload = await response.json().catch(() => ({}));
+
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.error || "Embeddings could not be created.");
   }
 
-  if (value.includes("regression")) {
-    return { folderName: "Regression", reason: 'Filename contains "regression".' };
+  return payload;
+}
+
+async function syncPgvector(payload) {
+  const response = await fetch("/api/vector/upsert", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+  const body = await response.json().catch(() => ({}));
+
+  if (!response.ok || !body.ok) {
+    throw new Error(body.error || "pgvector sync failed.");
   }
 
-  return null;
+  return body;
+}
+
+async function searchPgvector(embedding, limit = 5) {
+  const response = await fetch("/api/vector/search", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ embedding, limit })
+  });
+  const body = await response.json().catch(() => ({}));
+
+  if (!response.ok || !body.ok) {
+    throw new Error(body.error || "pgvector search failed.");
+  }
+
+  return body.results || [];
+}
+
+async function askLLMForFolderDecision(payload) {
+  const response = await fetch("/api/llm/folder-decision", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      ...payload,
+      model: LLM_DECISION_MODEL
+    })
+  });
+  const body = await response.json().catch(() => ({}));
+
+  if (!response.ok || !body.ok) {
+    const details = body.details && typeof body.details === "object"
+      ? body.details
+      : null;
+    const preview = details?.output_preview ? ` Output preview: ${details.output_preview}` : "";
+    const parseError = details?.parse_error ? ` Parse error: ${details.parse_error}` : "";
+    throw new Error(`${body.error || "LLM folder decision failed."}${parseError}${preview}`.trim());
+  }
+
+  return body.decision;
+}
+
+function averageEmbeddings(embeddings) {
+  const usable = embeddings.filter((embedding) => Array.isArray(embedding) && embedding.length);
+  if (!usable.length) return [];
+
+  const dimensions = usable[0].length;
+  const average = Array(dimensions).fill(0);
+
+  usable.forEach((embedding) => {
+    embedding.forEach((value, index) => {
+      average[index] += value;
+    });
+  });
+
+  return average.map((value) => value / usable.length);
+}
+
+function cosineSimilarity(left, right) {
+  if (!left?.length || !right?.length || left.length !== right.length) return 0;
+
+  let dot = 0;
+  let leftMagnitude = 0;
+  let rightMagnitude = 0;
+
+  for (let index = 0; index < left.length; index += 1) {
+    dot += left[index] * right[index];
+    leftMagnitude += left[index] * left[index];
+    rightMagnitude += right[index] * right[index];
+  }
+
+  if (!leftMagnitude || !rightMagnitude) return 0;
+  return dot / (Math.sqrt(leftMagnitude) * Math.sqrt(rightMagnitude));
+}
+
+function normalizeNewFolderName(name) {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return "";
+
+  // Keep this intentionally small and conservative: strip common "too-specific" suffix words.
+  const dropWords = new Set([
+    "technique",
+    "techniques",
+    "method",
+    "methods",
+    "optimization",
+    "optimizations",
+    "slides",
+    "slide",
+    "lecture",
+    "lectures",
+    "notes",
+    "note"
+  ]);
+
+  const words = trimmed.split(/\s+/).filter(Boolean);
+  while (words.length > 1 && dropWords.has(words[words.length - 1].toLowerCase())) {
+    words.pop();
+  }
+
+  return words.join(" ").trim();
 }
 
 export default function Home() {
@@ -130,8 +341,21 @@ export default function Home() {
   const [itemContent, setItemContent] = useState("");
   const [itemFile, setItemFile] = useState(null);
   const [itemError, setItemError] = useState("");
+  const [itemStatus, setItemStatus] = useState("");
+  const [itemSaving, setItemSaving] = useState(false);
   const [query, setQuery] = useState("");
   const [submittedQuery, setSubmittedQuery] = useState("");
+  const [queryResults, setQueryResults] = useState([]);
+  const [queryError, setQueryError] = useState("");
+  const [querySearching, setQuerySearching] = useState(false);
+  const [embeddingStatus, setEmbeddingStatus] = useState("");
+  const [embeddingError, setEmbeddingError] = useState("");
+  const [embeddingSaving, setEmbeddingSaving] = useState(false);
+  const [decisionStatus, setDecisionStatus] = useState("");
+  const [decisionError, setDecisionError] = useState("");
+  const [decisionSaving, setDecisionSaving] = useState(false);
+  const [vectorStatus, setVectorStatus] = useState("");
+  const [vectorError, setVectorError] = useState("");
   const [storageReady, setStorageReady] = useState(false);
   const [storageError, setStorageError] = useState("");
   const [data, setData] = useState({
@@ -139,7 +363,9 @@ export default function Home() {
     items: [],
     folderItems: [],
     suggestions: [],
-    localFiles: []
+    localFiles: [],
+    documentChunks: [],
+    folderProfiles: []
   });
 
   async function ensureDb() {
@@ -158,7 +384,7 @@ export default function Home() {
   async function refresh(nextDb = dbRef.current) {
     const liveDb = nextDb || (await ensureDb());
 
-    const [folders, items, folderItems, suggestions, localFiles] = await Promise.all(
+    const [folders, items, folderItems, suggestions, localFiles, documentChunks, folderProfiles] = await Promise.all(
       STORE_NAMES.map((storeName) => getAll(liveDb, storeName))
     );
 
@@ -167,8 +393,32 @@ export default function Home() {
       items: items.sort((a, b) => b.created_at.localeCompare(a.created_at)),
       folderItems,
       suggestions: suggestions.sort((a, b) => b.created_at.localeCompare(a.created_at)),
-      localFiles
+      localFiles,
+      documentChunks,
+      folderProfiles
     });
+  }
+
+  async function cleanupLegacyTestingFolder(liveDb) {
+    const [folders, folderItems, folderProfiles] = await Promise.all([
+      getAll(liveDb, "folders"),
+      getAll(liveDb, "folder_items"),
+      getAll(liveDb, "folder_profiles")
+    ]);
+    const legacyFolders = folders.filter(
+      (folder) => folder.name.toLowerCase() === LEGACY_DEVELOPMENT_TESTING_FOLDER_NAME.toLowerCase()
+    );
+    if (!legacyFolders.length) return;
+
+    const legacyFolderIds = new Set(legacyFolders.map((folder) => folder.id));
+    const legacyRelations = folderItems.filter((row) => legacyFolderIds.has(row.folder_id));
+    const legacyProfiles = folderProfiles.filter((profile) => legacyFolderIds.has(profile.folder_id));
+
+    await Promise.all([
+      ...legacyRelations.map((row) => deleteRecord(liveDb, "folder_items", row.id)),
+      ...legacyProfiles.map((profile) => deleteRecord(liveDb, "folder_profiles", profile.id)),
+      ...legacyFolders.map((folder) => deleteRecord(liveDb, "folders", folder.id))
+    ]);
   }
 
   useEffect(() => {
@@ -177,6 +427,7 @@ export default function Home() {
     async function boot() {
       const nextDb = await ensureDb();
       if (!mounted) return;
+      await cleanupLegacyTestingFolder(nextDb);
       await refresh(nextDb);
     }
 
@@ -194,18 +445,29 @@ export default function Home() {
     () => data.suggestions.filter((suggestion) => suggestion.status === "pending"),
     [data.suggestions]
   );
+  const pendingEmbeddingChunks = useMemo(
+    () => data.documentChunks.filter((chunk) => chunk.text?.trim() && chunk.embedding_status !== "embedded"),
+    [data.documentChunks]
+  );
+  const embeddedChunks = useMemo(
+    () => data.documentChunks.filter((chunk) => Array.isArray(chunk.embedding) && chunk.embedding.length),
+    [data.documentChunks]
+  );
+  const decisionCandidateItems = useMemo(
+    () => data.items.filter((item) => item.status === "embedded" && item.staged_for === "llm_decision"),
+    [data.items]
+  );
+  const realFolders = useMemo(
+    () => data.folders.filter(
+      (folder) => folder.name.toLowerCase() !== LEGACY_DEVELOPMENT_TESTING_FOLDER_NAME.toLowerCase()
+    ),
+    [data.folders]
+  );
 
   const selectedFolder = data.folders.find((folder) => folder.id === selectedFolderId) || null;
   const selectedFolderItems = selectedFolder
     ? data.items.filter((item) =>
       data.folderItems.some((row) => row.folder_id === selectedFolder.id && row.item_id === item.id)
-    )
-    : [];
-  const machineLearningFolder =
-    data.folders.find((folder) => folder.name.toLowerCase() === "machine learning") || null;
-  const machineLearningReferences = machineLearningFolder
-    ? data.items.filter((item) =>
-      data.folderItems.some((row) => row.folder_id === machineLearningFolder.id && row.item_id === item.id)
     )
     : [];
   const hasQuery = submittedQuery.trim().length > 0;
@@ -225,6 +487,496 @@ export default function Home() {
   function fileCopyForItem(item) {
     if (!item) return null;
     return data.localFiles.find((file) => file.id === item.local_file_id || file.item_id === item.id) || null;
+  }
+
+  function chunkCountForItem(itemId) {
+    return data.documentChunks.filter((chunk) => chunk.item_id === itemId).length;
+  }
+
+  function embeddedChunkCountForItem(itemId) {
+    return data.documentChunks.filter(
+      (chunk) => chunk.item_id === itemId && chunk.embedding_status === "embedded"
+    ).length;
+  }
+
+  function folderNameForItem(itemId) {
+    const relation = data.folderItems.find((row) => row.item_id === itemId);
+    return relation ? folderById(relation.folder_id)?.name || "Unfiled" : "Unfiled";
+  }
+
+  function pgvectorSourceForItem(item) {
+    return {
+      source_id: item.source_id || item.id,
+      source_type: item.source_type || item.parser_source_type || item.type,
+      title: item.title,
+      raw_text: item.raw_text || item.content_text || "",
+      metadata: item.metadata || {},
+      parser: item.parser || "unknown",
+      created_at: item.created_at,
+      updated_at: item.updated_at
+    };
+  }
+
+  function chunksForItem(itemId) {
+    return data.documentChunks
+      .filter((chunk) => chunk.item_id === itemId)
+      .sort((left, right) => left.chunk_index - right.chunk_index);
+  }
+
+  function buildFolderProfileText(folder) {
+    const relations = data.folderItems.filter(
+      (row) => row.folder_id === folder.id && row.assignment_type !== LEGACY_DEVELOPMENT_ASSIGNMENT_TYPE
+    );
+    const relatedItems = relations
+      .map((row) => itemById(row.item_id))
+      .filter(Boolean)
+      .slice(0, 8);
+    const itemSummaries = relatedItems.map((item) => {
+      const snippet = chunksForItem(item.id)[0]?.text?.slice(0, 320) || item.raw_text?.slice(0, 320) || "";
+      return `- ${item.title}: ${snippet}`;
+    });
+
+    return [
+      `Folder: ${folder.name}`,
+      folder.description ? `Description: ${folder.description}` : "",
+      itemSummaries.length ? `Known contents:\n${itemSummaries.join("\n")}` : ""
+    ].filter(Boolean).join("\n\n");
+  }
+
+  function localFolderProfileFor(folderId) {
+    return data.folderProfiles.find((profile) => profile.folder_id === folderId);
+  }
+
+  async function ensureFolderProfiles(liveDb) {
+    const profiles = [];
+    const foldersToProfile = realFolders;
+
+    for (let index = 0; index < foldersToProfile.length; index += EMBEDDING_BATCH_SIZE) {
+      const batch = foldersToProfile.slice(index, index + EMBEDDING_BATCH_SIZE);
+      const profileInputs = batch.map((folder) => ({
+        folder,
+        profileText: buildFolderProfileText(folder)
+      }));
+      const changedInputs = profileInputs.filter(({ folder, profileText }) => {
+        const existing = localFolderProfileFor(folder.id);
+        return !existing?.embedding?.length || existing.profile_text !== profileText;
+      });
+
+      if (changedInputs.length) {
+        const payload = await createEmbeddings(changedInputs.map((entry) => entry.profileText));
+        const now = timestamp();
+        const records = changedInputs.map(({ folder, profileText }, embeddingIndex) => {
+            const record = {
+              id: `folder_profile:${folder.id}`,
+              folder_id: folder.id,
+              profile_text: profileText,
+              metadata: {
+                folder_name: folder.name,
+                item_count: data.folderItems.filter(
+                  (row) => row.folder_id === folder.id && row.assignment_type !== LEGACY_DEVELOPMENT_ASSIGNMENT_TYPE
+                ).length
+              },
+              embedding: payload.embeddings[embeddingIndex],
+              embedding_model: payload.model || EMBEDDING_MODEL,
+              embedding_dimensions: payload.dimensions || EMBEDDING_DIMENSIONS,
+              created_at: localFolderProfileFor(folder.id)?.created_at || now,
+              updated_at: now
+            };
+            profiles.push(record);
+            return record;
+          });
+        await Promise.all(records.map((record) => putRecord(liveDb, "folder_profiles", record)));
+        try {
+          await syncPgvector({ folders: changedInputs.map((entry) => entry.folder), folderProfiles: records });
+          setVectorStatus("pgvector synced folder profiles.");
+          setVectorError("");
+        } catch (error) {
+          setVectorStatus("");
+          setVectorError(`pgvector sync skipped: ${error.message}`);
+        }
+      }
+
+      profileInputs.forEach(({ folder }) => {
+        const existing = localFolderProfileFor(folder.id);
+        if (existing && !profiles.some((profile) => profile.folder_id === folder.id)) {
+          profiles.push(existing);
+        }
+      });
+    }
+
+    return profiles;
+  }
+
+  function compareDocumentToFolderProfiles(item, profiles, itemChunks = chunksForItem(item.id)) {
+    const embeddedItemChunks = itemChunks.filter((chunk) => Array.isArray(chunk.embedding) && chunk.embedding.length);
+    const itemEmbedding = averageEmbeddings(embeddedItemChunks.map((chunk) => chunk.embedding));
+    if (!itemEmbedding.length) return [];
+
+    return profiles
+      .map((profile) => {
+        const averageScore = cosineSimilarity(itemEmbedding, profile.embedding);
+        const chunkScore = Math.max(
+          0,
+          ...embeddedItemChunks.map((chunk) => cosineSimilarity(chunk.embedding, profile.embedding))
+        );
+        const score = Math.max(averageScore, chunkScore);
+
+        return {
+          folder: folderById(profile.folder_id),
+          profile,
+          score,
+          average_score: averageScore,
+          chunk_score: chunkScore
+        };
+      })
+      .filter((result) => result.folder)
+      .sort((left, right) => right.score - left.score);
+  }
+
+  async function embedChunkRecords(liveDb, chunks, reportStatus = () => {}) {
+    const embeddableChunks = chunks.filter((chunk) => chunk.text?.trim());
+    if (!embeddableChunks.length) return chunks;
+
+    const updatedById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
+
+    for (let offset = 0; offset < embeddableChunks.length; offset += EMBEDDING_BATCH_SIZE) {
+      const batch = embeddableChunks.slice(offset, offset + EMBEDDING_BATCH_SIZE);
+      reportStatus(`Embedding ${offset + 1}-${offset + batch.length} of ${embeddableChunks.length} chunks...`);
+
+      const payload = await createEmbeddings(batch.map((chunk) => chunk.text));
+      const now = timestamp();
+      const updatedChunks = batch.map((chunk, index) => ({
+        ...chunk,
+        embedding: payload.embeddings[index],
+        embedding_model: payload.model || EMBEDDING_MODEL,
+        embedding_dimensions: payload.dimensions || EMBEDDING_DIMENSIONS,
+        embedding_status: "embedded",
+        embedded_at: now,
+        updated_at: now
+      }));
+
+      await Promise.all(updatedChunks.map((chunk) => putRecord(liveDb, "document_chunks", chunk)));
+      updatedChunks.forEach((chunk) => updatedById.set(chunk.id, chunk));
+    }
+
+    return chunks.map((chunk) => updatedById.get(chunk.id) || chunk);
+  }
+
+  async function markItemEmbedded(liveDb, item, itemChunks) {
+    const now = timestamp();
+    const embeddedChunkCount = itemChunks.filter((chunk) => chunk.embedding_status === "embedded").length;
+    const updatedItem = {
+      ...item,
+      status: "embedded",
+      embedding_status: embeddedChunkCount ? "embedded" : "not_applicable",
+      embedding_model: EMBEDDING_MODEL,
+      embedding_dimensions: EMBEDDING_DIMENSIONS,
+      embedded_chunk_count: embeddedChunkCount,
+      staged_for: "llm_decision",
+      updated_at: now
+    };
+
+    await putRecord(liveDb, "items", updatedItem);
+    return updatedItem;
+  }
+
+  async function decideFolderForEmbeddedItem(liveDb, item, itemChunks = chunksForItem(item.id), profiles = null) {
+    const folderProfiles = profiles || await ensureFolderProfiles(liveDb);
+    const rankedProfiles = compareDocumentToFolderProfiles(item, folderProfiles, itemChunks);
+    const best = rankedProfiles[0] || null;
+    const eligibleMatches = rankedProfiles.filter((result) => result.score >= FOLDER_MATCH_THRESHOLD);
+
+    if (eligibleMatches.length) {
+      return assignItemToFinalFolders(liveDb, item, eligibleMatches.map((match) => match.folder), {
+        decision_source: "embedding_similarity",
+        similarity_score: best.score,
+        matched_folders: eligibleMatches.map((match) => ({
+          folder_id: match.folder.id,
+          folder_name: match.folder.name,
+          similarity_score: match.score,
+          average_score: match.average_score,
+          chunk_score: match.chunk_score
+        })),
+        reason: `${eligibleMatches.length} folder profile${eligibleMatches.length === 1 ? "" : "s"} met threshold ${(FOLDER_MATCH_THRESHOLD * 100).toFixed(0)}%.`
+      }, itemChunks);
+    }
+
+    const decision = await askLLMForFolderDecision({
+      item: {
+        source_id: item.source_id || item.id,
+        title: item.title,
+        source_type: item.source_type || item.type,
+        raw_text: (item.raw_text || item.content_text || "").slice(0, 4000),
+        chunks: itemChunks.slice(0, 6).map((chunk) => ({
+          heading: chunk.heading,
+          text: chunk.text.slice(0, 900)
+        }))
+      },
+      candidates: rankedProfiles.slice(0, 20).map(({ folder, profile, score }) => ({
+        folder_id: folder.id,
+        name: folder.name,
+        description: folder.description || "",
+        similarity_score: score,
+        profile_text: (profile?.profile_text || "").slice(0, 900)
+      })),
+      threshold: FOLDER_MATCH_THRESHOLD
+    });
+
+    const selectedFolder = decision.action === "assign_existing"
+      ? folderById(decision.folder_id)
+      : null;
+    if (decision.action === "assign_existing" && !selectedFolder) {
+      throw new Error("LLM chose assign_existing but returned an unknown folder_id.");
+    }
+    const requestedFolderName = normalizeNewFolderName(decision.new_folder_name) || "New Topic";
+    const existingNamedFolder = realFolders.find(
+      (folder) => folder.name.toLowerCase() === requestedFolderName.toLowerCase()
+    );
+    const folder = selectedFolder || existingNamedFolder || await createFolderRecord(
+      requestedFolderName,
+      decision.new_folder_description || "Created by LLM folder decisioning.",
+      liveDb
+    );
+
+    return assignItemToFinalFolders(liveDb, item, [folder], {
+      decision_source: selectedFolder || existingNamedFolder ? "llm_existing_folder" : "llm_new_folder",
+      similarity_score: best?.score || 0,
+      reason: decision.reason || "LLM resolved a low-confidence folder decision.",
+      llm_model: LLM_DECISION_MODEL
+    }, itemChunks);
+  }
+
+  async function embedPendingChunks() {
+    setEmbeddingError("");
+    setEmbeddingStatus("");
+
+    if (!pendingEmbeddingChunks.length) {
+      setEmbeddingStatus("All parsed chunks are embedded.");
+      return;
+    }
+
+    setEmbeddingSaving(true);
+    try {
+      const liveDb = await ensureDb();
+      const affectedItemIds = new Set();
+
+      for (let offset = 0; offset < pendingEmbeddingChunks.length; offset += EMBEDDING_BATCH_SIZE) {
+        const batch = pendingEmbeddingChunks.slice(offset, offset + EMBEDDING_BATCH_SIZE);
+        setEmbeddingStatus(`Embedding ${offset + 1}-${offset + batch.length} of ${pendingEmbeddingChunks.length} chunks...`);
+
+        const payload = await createEmbeddings(batch.map((chunk) => chunk.text));
+        const now = timestamp();
+        const updatedChunks = batch.map((chunk, index) => ({
+          ...chunk,
+          embedding: payload.embeddings[index],
+          embedding_model: payload.model || EMBEDDING_MODEL,
+          embedding_dimensions: payload.dimensions || EMBEDDING_DIMENSIONS,
+          embedding_status: "embedded",
+          embedded_at: now,
+          updated_at: now
+        }));
+
+        await Promise.all(
+          updatedChunks.map((chunk) => {
+            affectedItemIds.add(chunk.item_id);
+            return putRecord(liveDb, "document_chunks", chunk);
+          })
+        );
+
+        try {
+          const batchItems = [...new Set(updatedChunks.map((chunk) => chunk.item_id))]
+            .map((itemId) => itemById(itemId))
+            .filter(Boolean);
+          await syncPgvector({
+            sources: batchItems.map(pgvectorSourceForItem),
+            chunks: updatedChunks
+          });
+          setVectorStatus(`pgvector synced ${offset + batch.length} embedded chunks.`);
+          setVectorError("");
+        } catch (error) {
+          setVectorStatus("");
+          setVectorError(`pgvector sync skipped: ${error.message}`);
+        }
+      }
+
+      const now = timestamp();
+      await Promise.all(
+        [...affectedItemIds].map((itemId) => {
+          const item = itemById(itemId);
+          if (!item) return Promise.resolve();
+          const itemChunks = data.documentChunks.filter((chunk) => chunk.item_id === itemId);
+          return putRecord(liveDb, "items", {
+            ...item,
+            status: "embedded",
+            embedding_status: "embedded",
+            embedding_model: EMBEDDING_MODEL,
+            embedding_dimensions: EMBEDDING_DIMENSIONS,
+            embedded_chunk_count: itemChunks.length,
+            staged_for: "llm_decision",
+            updated_at: now
+          });
+        })
+      );
+
+      setEmbeddingStatus("Embedding stage complete.");
+      await refresh(liveDb);
+    } catch (error) {
+      setEmbeddingError(error.message || "Embeddings could not be created.");
+      setEmbeddingStatus("");
+    } finally {
+      setEmbeddingSaving(false);
+    }
+  }
+
+  async function decideFoldersForEmbeddedItems() {
+    setDecisionError("");
+    setDecisionStatus("");
+
+    if (!decisionCandidateItems.length) {
+      setDecisionStatus("No embedded staged items are waiting for folder decisions.");
+      return;
+    }
+
+    setDecisionSaving(true);
+    try {
+      const liveDb = await ensureDb();
+      setDecisionStatus("Updating folder profiles...");
+      const profiles = await ensureFolderProfiles(liveDb);
+
+      for (const item of decisionCandidateItems) {
+        setDecisionStatus(`Deciding folder for ${item.title}...`);
+        await decideFolderForEmbeddedItem(liveDb, item, chunksForItem(item.id), profiles);
+      }
+
+      setDecisionStatus("Folder decisioning complete.");
+      await refresh(liveDb);
+    } catch (error) {
+      setDecisionError(error.message || "Folder decisioning failed.");
+      setDecisionStatus("");
+    } finally {
+      setDecisionSaving(false);
+    }
+  }
+
+  async function assignItemToFinalFolders(liveDb, item, folders, decision, itemChunks = chunksForItem(item.id)) {
+    const now = timestamp();
+    const uniqueFolders = [...new Map(folders.filter(Boolean).map((folder) => [folder.id, folder])).values()];
+    if (!uniqueFolders.length) {
+      throw new Error("At least one folder is required for folder assignment.");
+    }
+
+    const stagingRelations = data.folderItems.filter(
+      (row) => row.item_id === item.id && row.assignment_type === LEGACY_DEVELOPMENT_ASSIGNMENT_TYPE
+    );
+    const relations = uniqueFolders.map((folder) => ({
+      id: `${folder.id}:${item.id}`,
+      folder_id: folder.id,
+      source_id: item.source_id || item.id,
+      item_id: item.id,
+      assignment_type: decision.decision_source,
+      created_at: now
+    }));
+    const primaryFolder = uniqueFolders[0];
+    const updatedItem = {
+      ...item,
+      status: "assigned",
+      staged_for: "",
+      assigned_folder_id: primaryFolder.id,
+      assigned_folder_ids: uniqueFolders.map((folder) => folder.id),
+      folder_decision: {
+        ...decision,
+        folder_id: primaryFolder.id,
+        folder_name: primaryFolder.name,
+        folder_ids: uniqueFolders.map((folder) => folder.id),
+        folder_names: uniqueFolders.map((folder) => folder.name),
+        decided_at: now
+      },
+      updated_at: now
+    };
+
+    await Promise.all([
+      ...stagingRelations.map((row) => deleteRecord(liveDb, "folder_items", row.id)),
+      ...uniqueFolders.map((folder) => putRecord(liveDb, "folders", folder)),
+      ...relations.map((relation) => putRecord(liveDb, "folder_items", relation)),
+      putRecord(liveDb, "items", updatedItem)
+    ]);
+
+    try {
+      await syncPgvector({
+        source: pgvectorSourceForItem(updatedItem),
+        folders: uniqueFolders,
+        folderItems: relations,
+        chunks: itemChunks,
+        deleteFolderItemIds: stagingRelations.map((row) => row.id)
+      });
+      setVectorStatus("pgvector synced folder decision.");
+      setVectorError("");
+    } catch (error) {
+      setVectorStatus("");
+      setVectorError(`pgvector sync skipped: ${error.message}`);
+    }
+
+    setSelectedFolderId(primaryFolder.id);
+    return updatedItem;
+  }
+
+  async function searchEmbeddedChunks(event) {
+    event.preventDefault();
+    const trimmedQuery = query.trim();
+    setSubmittedQuery(trimmedQuery);
+    setQueryError("");
+    setQueryResults([]);
+
+    if (!trimmedQuery) return;
+
+    setQuerySearching(true);
+    try {
+      const payload = await createEmbeddings(trimmedQuery);
+      const queryEmbedding = payload.embeddings[0];
+      try {
+        const pgResults = await searchPgvector(queryEmbedding, 5);
+        setQueryResults(
+          pgResults.map((result) => ({
+            chunk: result,
+            item: itemById(result.item_id) || {
+              id: result.item_id || result.source_id,
+              title: result.source_title,
+              source_type: result.source_type
+            },
+            folderName: result.folder_name,
+            score: Number(result.score) || 0
+          }))
+        );
+        setVectorStatus("pgvector semantic search complete.");
+        setVectorError("");
+        return;
+      } catch (error) {
+        setVectorStatus("");
+        setVectorError(`pgvector search skipped: ${error.message}`);
+      }
+
+      if (!embeddedChunks.length) {
+        setQueryError("No embedded chunks yet. Embed pending chunks from Manage first.");
+        return;
+      }
+
+      const rankedResults = embeddedChunks
+        .map((chunk) => ({
+          chunk,
+          item: itemById(chunk.item_id),
+          folderName: folderNameForItem(chunk.item_id),
+          score: cosineSimilarity(queryEmbedding, chunk.embedding)
+        }))
+        .filter((result) => result.item)
+        .sort((left, right) => right.score - left.score)
+        .slice(0, 5);
+
+      setQueryResults(rankedResults);
+    } catch (error) {
+      setQueryError(error.message || "Semantic search failed.");
+    } finally {
+      setQuerySearching(false);
+    }
   }
 
   async function saveFolder(event) {
@@ -255,6 +1007,14 @@ export default function Home() {
     try {
       const liveDb = await ensureDb();
       await putRecord(liveDb, "folders", folder);
+      try {
+        await syncPgvector({ folders: [folder] });
+        setVectorStatus("pgvector synced folder.");
+        setVectorError("");
+      } catch (error) {
+        setVectorStatus("");
+        setVectorError(`pgvector sync skipped: ${error.message}`);
+      }
       setSelectedFolderId(folder.id);
       setFolderName("");
       setFolderDescription("");
@@ -268,6 +1028,7 @@ export default function Home() {
   async function addItem(event) {
     event.preventDefault();
     setItemError("");
+    setItemStatus("");
 
     const title = (itemTitle || itemFile?.name || "Untitled note").trim();
     const content = itemContent.trim();
@@ -287,30 +1048,62 @@ export default function Home() {
       return;
     }
 
-    const now = timestamp();
-    const localFileId = itemType === "file" ? createId("local_file") : "";
-    const item = {
-      id: createId("item"),
-      type: itemType,
-      title,
-      source_path: itemFile ? `indexeddb://${itemFile.name}` : "",
-      content_text: itemType === "note" ? content : `Mock extracted text for ${title}`,
-      local_file_id: localFileId,
-      file_name: itemFile?.name || "",
-      file_size: itemFile?.size || 0,
-      mime_type: itemFile?.type || "",
-      status: "stored",
-      created_at: now,
-      updated_at: now
-    };
-
+    setItemSaving(true);
     try {
+      setItemStatus(itemType === "file" ? "Parsing with Docling..." : "Preparing note...");
+      const parsedDocument = itemType === "file" ? await parseFileWithDocling(itemFile) : parseNoteContent(content);
+      const now = timestamp();
+      const itemId = createId("item");
+      const localFileId = itemType === "file" ? createId("local_file") : "";
+      const rawText = parsedDocument.text || content;
+      const sourceType = parsedDocument.source_type || itemType;
+      const sourceMetadata = {
+        ...(parsedDocument.metadata || {}),
+        file_name: itemFile?.name || "",
+        file_size: itemFile?.size || 0,
+        mime_type: itemFile?.type || "",
+        parser: parsedDocument.parser || "unknown",
+        parsed_at: now,
+        title,
+        url: ""
+      };
+      const item = {
+        id: itemId,
+        source_id: itemId,
+        source_type: sourceType,
+        type: itemType,
+        title,
+        source_path: itemFile ? `indexeddb://${itemFile.name}` : "",
+        raw_text: rawText,
+        content_text: rawText,
+        parsed_markdown: parsedDocument.markdown || rawText,
+        metadata: sourceMetadata,
+        parser: parsedDocument.parser || "unknown",
+        parser_source_type: sourceType,
+        parsed_at: now,
+        parsed_chunk_count: parsedDocument.chunks?.length || 0,
+        local_file_id: localFileId,
+        file_name: itemFile?.name || "",
+        file_size: itemFile?.size || 0,
+        mime_type: itemFile?.type || "",
+        status: "stored",
+        created_at: now,
+        updated_at: now
+      };
+
+      setItemStatus("Saving parsed chunks...");
       const liveDb = await ensureDb();
-      await putRecord(liveDb, "items", item);
+      const parsedItem = {
+        ...item,
+        status: "parsed",
+        staged_for: "embedding",
+        updated_at: timestamp()
+      };
+      await putRecord(liveDb, "items", parsedItem);
       if (itemType === "file") {
         await putRecord(liveDb, "local_files", {
           id: localFileId,
-          item_id: item.id,
+          item_id: parsedItem.id,
           file_name: itemFile.name,
           mime_type: itemFile.type || "application/octet-stream",
           size: itemFile.size,
@@ -318,55 +1111,66 @@ export default function Home() {
           created_at: now
         });
       }
-      await createSuggestion(item);
+      const chunkRecords = await saveDocumentChunks(liveDb, parsedItem, parsedDocument.chunks || [], now);
+      const embeddedChunksForItem = await embedChunkRecords(liveDb, chunkRecords, setItemStatus);
+      const embeddedItem = await markItemEmbedded(liveDb, parsedItem, embeddedChunksForItem);
+      setVectorError("");
+      try {
+        await syncPgvector({
+          source: pgvectorSourceForItem(embeddedItem),
+          chunks: embeddedChunksForItem
+        });
+        setVectorStatus("pgvector synced embedded chunks.");
+      } catch (error) {
+        setVectorStatus("");
+        setVectorError(`pgvector sync skipped: ${error.message}`);
+      }
+
+      setItemStatus("Deciding folder...");
+      await decideFolderForEmbeddedItem(liveDb, embeddedItem, embeddedChunksForItem);
       setItemTitle("");
       setItemContent("");
       setItemFile(null);
-      setSelectedFolderId(null);
+      setItemStatus("");
       await refresh(liveDb);
     } catch (error) {
       setItemError(error.message || "Item could not be saved locally.");
+      setItemStatus("");
+    } finally {
+      setItemSaving(false);
     }
   }
 
-  async function createSuggestion(item) {
-    const liveDb = await ensureDb();
-    const match = findSuggestionMatch(item.title);
-    const now = timestamp();
-
-    if (!match) {
-      await putRecord(liveDb, "folder_suggestions", {
-        id: createId("suggestion"),
-        item_id: item.id,
-        folder_id: "",
-        suggested_folder_name: "",
-        reason: "No local keyword rule matched.",
-        status: "pending",
-        created_at: now,
-        updated_at: now
-      });
-      await putRecord(liveDb, "items", { ...item, status: "needs_review", updated_at: now });
-      return;
-    }
-
-    const existingFolder = data.folders.find(
-      (folder) => folder.name.toLowerCase() === match.folderName.toLowerCase()
-    );
-
-    await putRecord(liveDb, "folder_suggestions", {
-      id: createId("suggestion"),
+  async function saveDocumentChunks(liveDb, item, chunks, now) {
+    const records = chunks.map((chunk) => ({
+      id: `${item.id}:chunk:${chunk.index}`,
+      source_id: item.source_id,
+      source_type: item.source_type,
       item_id: item.id,
-      folder_id: existingFolder?.id || "",
-      suggested_folder_name: existingFolder ? "" : match.folderName,
-      reason: match.reason,
-      status: "pending",
+      chunk_index: chunk.index,
+      heading: chunk.heading || "Document",
+      markdown: chunk.markdown || chunk.text || "",
+      text: chunk.text || chunk.markdown || "",
+      char_count: chunk.char_count || (chunk.text || chunk.markdown || "").length,
+      parser: item.parser,
+      metadata: {
+        source_type: item.source_type,
+        parser: item.parser,
+        heading: chunk.heading || "Document"
+      },
+      embedding_status: "pending",
       created_at: now,
       updated_at: now
-    });
+    }));
+
+    await Promise.all(
+      records.map((record) => putRecord(liveDb, "document_chunks", record))
+    );
+    return records;
   }
 
-  async function createFolderRecord(name, description) {
-    const liveDb = await ensureDb();
+  async function createFolderRecord(name, description, providedDb) {
+    const liveDb = providedDb || (await ensureDb());
     const now = timestamp();
     const folder = {
       id: createId("folder"),
@@ -404,6 +1208,7 @@ export default function Home() {
     await putRecord(liveDb, "folder_items", {
       id: `${folderId}:${itemId}`,
       folder_id: folderId,
+      source_id: item.source_id || item.id,
       item_id: itemId,
       assignment_type: assignmentType,
       created_at: now
@@ -438,11 +1243,13 @@ export default function Home() {
     const fileCopies = data.localFiles.filter((file) => file.item_id === itemId);
     const itemSuggestions = data.suggestions.filter((suggestion) => suggestion.item_id === itemId);
     const itemRelations = data.folderItems.filter((row) => row.item_id === itemId);
+    const itemChunks = data.documentChunks.filter((chunk) => chunk.item_id === itemId);
 
     await Promise.all([
       ...fileCopies.map((file) => deleteRecord(liveDb, "local_files", file.id)),
       ...itemSuggestions.map((suggestion) => deleteRecord(liveDb, "folder_suggestions", suggestion.id)),
       ...itemRelations.map((row) => deleteRecord(liveDb, "folder_items", row.id)),
+      ...itemChunks.map((chunk) => deleteRecord(liveDb, "document_chunks", chunk.id)),
       deleteRecord(liveDb, "items", itemId)
     ]);
 
@@ -456,24 +1263,26 @@ export default function Home() {
 
     const folderRelations = data.folderItems.filter((row) => row.folder_id === folderId);
     const itemIds = [...new Set(folderRelations.map((row) => row.item_id))];
+    const itemIdsOnlyInThisFolder = itemIds.filter((itemId) =>
+      data.folderItems.every((row) => row.item_id !== itemId || row.folder_id === folderId)
+    );
     const shouldRemove = window.confirm(
-      `Remove "${folder.name}" and ${itemIds.length} stored file${itemIds.length === 1 ? "" : "s"}?`
+      `Remove "${folder.name}" and ${itemIdsOnlyInThisFolder.length} stored file${itemIdsOnlyInThisFolder.length === 1 ? "" : "s"} only kept there?`
     );
     if (!shouldRemove) return;
 
     const folderSuggestions = data.suggestions.filter(
-      (suggestion) => suggestion.folder_id === folderId || itemIds.includes(suggestion.item_id)
+      (suggestion) => suggestion.folder_id === folderId || itemIdsOnlyInThisFolder.includes(suggestion.item_id)
     );
-    const itemRelations = data.folderItems.filter((row) => itemIds.includes(row.item_id));
-    const fileCopies = data.localFiles.filter((file) => itemIds.includes(file.item_id));
+    const fileCopies = data.localFiles.filter((file) => itemIdsOnlyInThisFolder.includes(file.item_id));
+    const itemChunks = data.documentChunks.filter((chunk) => itemIdsOnlyInThisFolder.includes(chunk.item_id));
 
-    // Future production flow: only remove files solely associated with this folder,
-    // then ask the user to confirm if that list of unique files will be removed.
     await Promise.all([
       ...fileCopies.map((file) => deleteRecord(liveDb, "local_files", file.id)),
+      ...itemChunks.map((chunk) => deleteRecord(liveDb, "document_chunks", chunk.id)),
       ...folderSuggestions.map((suggestion) => deleteRecord(liveDb, "folder_suggestions", suggestion.id)),
-      ...itemRelations.map((row) => deleteRecord(liveDb, "folder_items", row.id)),
-      ...itemIds.map((itemId) => deleteRecord(liveDb, "items", itemId)),
+      ...folderRelations.map((row) => deleteRecord(liveDb, "folder_items", row.id)),
+      ...itemIdsOnlyInThisFolder.map((itemId) => deleteRecord(liveDb, "items", itemId)),
       deleteRecord(liveDb, "folders", folderId)
     ]);
 
@@ -518,10 +1327,7 @@ export default function Home() {
         <section className="query-view" aria-label="Query">
           <form
             className="query-bar"
-            onSubmit={(event) => {
-              event.preventDefault();
-              setSubmittedQuery(query.trim());
-            }}
+            onSubmit={searchEmbeddedChunks}
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M10.8 4.2a6.6 6.6 0 1 1 0 13.2 6.6 6.6 0 0 1 0-13.2Zm0 2a4.6 4.6 0 1 0 0 9.2 4.6 4.6 0 0 0 0-9.2Zm5.1 9.7 4.1 4.1-1.4 1.4-4.1-4.1 1.4-1.4Z" />
@@ -532,36 +1338,38 @@ export default function Home() {
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
-            <button aria-label="Search" type="submit">
+            <button aria-label="Search" disabled={querySearching} type="submit">
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M10.8 4.2a6.6 6.6 0 1 1 0 13.2 6.6 6.6 0 0 1 0-13.2Zm0 2a4.6 4.6 0 1 0 0 9.2 4.6 4.6 0 0 0 0-9.2Zm5.1 9.7 4.1 4.1-1.4 1.4-4.1-4.1 1.4-1.4Z" />
               </svg>
             </button>
           </form>
+          {queryError ? <p className="storage-error">{queryError}</p> : null}
           {hasQuery ? (
             <section className="query-result" aria-label="Query result">
-              <p className="eyebrow">Prototype answer</p>
-              <p>
-                Gradient descent is an optimization algorithm that iteratively
-                adjusts parameters in the direction of the negative gradient to
-                minimize a function (like a loss function in machine learning).
-              </p>
+              <p className="eyebrow">Semantic retrieval</p>
+              <p>{querySearching ? "Searching embedded chunks..." : `Top matches for "${submittedQuery}"`}</p>
               <div className="reference-block">
-                <h2>References</h2>
-                {machineLearningReferences.length ? (
+                <h2>Relevant chunks</h2>
+                {queryResults.length ? (
                   <div className="reference-list">
-                    {machineLearningReferences.map((item) => (
-                      <article className="reference-card" key={item.id}>
+                    {queryResults.map(({ chunk, item, folderName, score }) => (
+                      <article className="reference-card" key={chunk.id}>
                         <div>
                           <h3>{item.title}</h3>
-                          <p>{machineLearningFolder.name}</p>
+                          <p>
+                            {folderName || folderNameForItem(item.id)} · {(score * 100).toFixed(1)}% match
+                          </p>
+                          <p>{chunk.text.slice(0, 220)}</p>
                         </div>
                         <LocalFilePreview fileCopy={fileCopyForItem(item)} />
                       </article>
                     ))}
                   </div>
                 ) : (
-                  <p className="muted-copy">No files are assigned to the Machine Learning folder yet.</p>
+                  <p className="muted-copy">
+                    {querySearching ? "Working..." : "No embedded chunks matched yet."}
+                  </p>
                 )}
               </div>
             </section>
@@ -612,6 +1420,7 @@ export default function Home() {
                 <label>
                   <span>Local file</span>
                   <input
+                    accept=".pdf,.docx,.pptx,.md,.markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/markdown,text/x-markdown"
                     type="file"
                     onChange={(event) => {
                       const file = event.target.files?.[0] || null;
@@ -632,7 +1441,10 @@ export default function Home() {
                 </label>
               )}
 
-              <button disabled={!storageReady} type="submit">Add Item</button>
+              <button disabled={!storageReady || itemSaving} type="submit">
+                {itemSaving ? "Processing..." : "Add Item"}
+              </button>
+              {itemStatus ? <p className="form-status">{itemStatus}</p> : null}
               {itemError ? <p className="form-error">{itemError}</p> : null}
             </form>
           </section>
@@ -644,7 +1456,8 @@ export default function Home() {
           <div className="storage-stats">
             <StatCard label="stored" value={data.items.length} />
             <StatCard label="folders" value={data.folders.length} />
-            <StatCard label="review" value={pendingSuggestions.length} />
+            <StatCard label="pending vectors" value={pendingEmbeddingChunks.length} />
+            <StatCard label="pending decisions" value={decisionCandidateItems.length} />
           </div>
 
           <div className="storage-grid">
@@ -723,7 +1536,14 @@ export default function Home() {
                 {selectedFolder ? (
                   selectedFolderItems.length ? (
                     selectedFolderItems.map((item) => (
-                      <ItemCard fileCopy={fileCopyForItem(item)} item={item} key={item.id} onRemove={removeItem} />
+                      <ItemCard
+                        chunkCount={chunkCountForItem(item.id)}
+                        embeddedChunkCount={embeddedChunkCountForItem(item.id)}
+                        fileCopy={fileCopyForItem(item)}
+                        item={item}
+                        key={item.id}
+                        onRemove={removeItem}
+                      />
                     ))
                   ) : (
                     <EmptyState />
@@ -739,6 +1559,7 @@ export default function Home() {
                         folders={data.folders}
                         folderById={folderById}
                         item={item}
+                        chunkCount={item ? chunkCountForItem(item.id) : 0}
                         key={suggestion.id}
                         onAccept={acceptSuggestion}
                         onCreate={createFolderFromSuggestion}
@@ -756,21 +1577,45 @@ export default function Home() {
             <aside className="right-column">
               <section className="panel tool-panel">
                 <div className="panel-heading">
-                  <h2>Review</h2>
-                  <button className="secondary compact" type="button" onClick={() => setSelectedFolderId(null)}>
-                    Open
+                  <h2>Embeddings</h2>
+                  <button
+                    className="secondary compact"
+                    disabled={!storageReady || embeddingSaving || !pendingEmbeddingChunks.length}
+                    type="button"
+                    onClick={embedPendingChunks}
+                  >
+                    Embed
                   </button>
                 </div>
                 <div className="compact-review">
-                  {pendingSuggestions.length ? (
-                    pendingSuggestions.slice(0, 3).map((suggestion) => {
-                      const item = itemById(suggestion.item_id);
-                      return item ? <p key={suggestion.id}>{item.title}</p> : null;
-                    })
-                  ) : (
-                    <p>No items waiting.</p>
-                  )}
+                  <p>{embeddedChunks.length} embedded chunks</p>
+                  <p>{pendingEmbeddingChunks.length} pending chunks</p>
+                  <p>{EMBEDDING_MODEL}</p>
                 </div>
+                {embeddingStatus ? <p className="form-status">{embeddingStatus}</p> : null}
+                {embeddingError ? <p className="form-error">{embeddingError}</p> : null}
+                {vectorStatus ? <p className="form-status">{vectorStatus}</p> : null}
+                {vectorError ? <p className="form-error">{vectorError}</p> : null}
+              </section>
+              <section className="panel tool-panel">
+                <div className="panel-heading">
+                  <h2>Folder Decisions</h2>
+                  <button
+                    className="secondary compact"
+                    disabled={!storageReady || decisionSaving || !decisionCandidateItems.length}
+                    type="button"
+                    onClick={decideFoldersForEmbeddedItems}
+                  >
+                    Decide
+                  </button>
+                </div>
+                <div className="compact-review">
+                  <p>{decisionCandidateItems.length} embedded items waiting</p>
+                  <p>{realFolders.length} candidate folders</p>
+                  <p>{Math.round(FOLDER_MATCH_THRESHOLD * 100)}% similarity threshold</p>
+                </div>
+                {decisionStatus ? <p className="form-status">{decisionStatus}</p> : null}
+                {decisionError ? <p className="form-error">{decisionError}</p> : null}
               </section>
             </aside>
           </div>
@@ -797,7 +1642,7 @@ function EmptyState() {
   );
 }
 
-function ItemCard({ fileCopy, item, onRemove }) {
+function ItemCard({ chunkCount, embeddedChunkCount, fileCopy, item, onRemove }) {
   return (
     <article className="item-card">
       <header>
@@ -809,10 +1654,13 @@ function ItemCard({ fileCopy, item, onRemove }) {
               : item.content_text.slice(0, 160)}
           </p>
         </div>
-        <span>{item.type}</span>
+        <span>{item.source_type || item.type}</span>
       </header>
       <div className="meta-row">
         <span>{item.status}</span>
+        <span>{chunkCount || item.parsed_chunk_count || 0} chunks</span>
+        <span>{embeddedChunkCount || item.embedded_chunk_count || 0} vectors</span>
+        <span>{item.parser || "parser"}</span>
         <span>{formatDate(item.created_at)}</span>
       </div>
       <div className="item-actions">
@@ -852,6 +1700,7 @@ function LocalFilePreview({ fileCopy }) {
 
 function ReviewCard({
   assignItem,
+  chunkCount,
   dismissSuggestion,
   fileCopy,
   folders,
@@ -881,6 +1730,10 @@ function ReviewCard({
       </header>
       <p>
         Suggested: <strong>{suggestedFolderName}</strong>
+      </p>
+      <p>
+        Parsed into <strong>{chunkCount || item.parsed_chunk_count || 0}</strong> chunks with{" "}
+        <strong>{item.parser || "the local parser"}</strong>.
       </p>
       {fileCopy ? (
         <p>

@@ -297,7 +297,7 @@ h3 {
 
 .storage-stats {
   display: grid;
-  grid-template-columns: repeat(3, minmax(100px, 1fr));
+  grid-template-columns: repeat(4, minmax(100px, 1fr));
   gap: 10px;
 }
 
@@ -414,6 +414,13 @@ select:focus {
   min-height: 18px;
   color: var(--danger);
   font-size: 13px;
+}
+
+.form-status {
+  min-height: 18px;
+  color: var(--accent-strong);
+  font-size: 13px;
+  font-weight: 800;
 }
 
 .folder-form {

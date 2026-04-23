@@ -5,10 +5,13 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "db:migrate": "node scripts/setup_pgvector.mjs",
+    "test:embeddings": "node scripts/test_embeddings.mjs",
     "start": "next start"
   },
   "dependencies": {
     "next": "^16.2.4",
+    "pg": "^8.20.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5"
   }
