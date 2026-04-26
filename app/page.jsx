@@ -20,6 +20,7 @@ const EMBEDDING_DIMENSIONS = 1536;
 const EMBEDDING_BATCH_SIZE = 64;
 const FOLDER_MATCH_THRESHOLD = 0.6;
 const LLM_DECISION_MODEL = "gpt-4o-mini";
+const LLM_QUERY_MODEL = "gpt-4o-mini";
 
 // DEBUG: upload + foldering pipeline logs (client console). Keep off in production.
 const DEBUG_UPLOAD_LOGS = process.env.NODE_ENV !== "production";
@@ -307,6 +308,31 @@ async function askLLMForFolderDecision(payload) {
   return body.decision;
 }
 
+async function askLLMForQueryAnswer(payload) {
+  const response = await fetch("/api/llm/query-answer", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      ...payload,
+      model: LLM_QUERY_MODEL
+    })
+  });
+  const body = await response.json().catch(() => ({}));
+
+  if (!response.ok || !body.ok) {
+    throw new Error(body.error || "LLM query answering failed.");
+  }
+
+  return {
+    answer: String(body.answer || "").trim(),
+    citedItemIds: Array.isArray(body.cited_item_ids)
+      ? body.cited_item_ids.map((value) => String(value || "")).filter(Boolean)
+      : []
+  };
+}
+
 function averageEmbeddings(embeddings) {
   const usable = embeddings.filter((embedding) => Array.isArray(embedding) && embedding.length);
   if (!usable.length) return [];
@@ -388,6 +414,7 @@ export default function Home() {
   const [queryResults, setQueryResults] = useState([]);
   const [queryError, setQueryError] = useState("");
   const [querySearching, setQuerySearching] = useState(false);
+  const [queryAnswer, setQueryAnswer] = useState("");
   const [embeddingStatus, setEmbeddingStatus] = useState("");
   const [embeddingError, setEmbeddingError] = useState("");
   const [embeddingSaving, setEmbeddingSaving] = useState(false);
@@ -511,6 +538,7 @@ export default function Home() {
     )
     : [];
   const hasQuery = submittedQuery.trim().length > 0;
+  const topRelevantResult = queryResults[0] || null;
 
   function folderCount(folderId) {
     return data.folderItems.filter((row) => row.folder_id === folderId).length;
@@ -561,6 +589,169 @@ export default function Home() {
     return data.documentChunks
       .filter((chunk) => chunk.item_id === itemId)
       .sort((left, right) => left.chunk_index - right.chunk_index);
+  }
+
+  function rankLocalChunkMatches(queryEmbedding) {
+    return embeddedChunks
+      .map((chunk) => ({
+        chunk,
+        item: itemById(chunk.item_id),
+        folderName: folderNameForItem(chunk.item_id),
+        score: cosineSimilarity(queryEmbedding, chunk.embedding)
+      }))
+      .filter((result) => result.item)
+      .sort((left, right) => right.score - left.score);
+  }
+
+  function buildQueryMatchesFromRankedChunks(rankedResults, preferredItemIds = [], limit = 5) {
+    const resultsByItemId = new Map();
+
+    rankedResults.forEach((result) => {
+      const itemId = result.item.id;
+      if (!resultsByItemId.has(itemId)) {
+        resultsByItemId.set(itemId, {
+          ...result,
+          contextChunks: [{
+            id: result.chunk.id,
+            chunk_index: result.chunk.chunk_index,
+            heading: result.chunk.heading,
+            text: result.chunk.text,
+            score: result.score
+          }]
+        });
+        return;
+      }
+
+      const existing = resultsByItemId.get(itemId);
+      if (existing.contextChunks.length >= 3) return;
+      existing.contextChunks.push({
+        id: result.chunk.id,
+        chunk_index: result.chunk.chunk_index,
+        heading: result.chunk.heading,
+        text: result.chunk.text,
+        score: result.score
+      });
+    });
+
+    const orderedItemIds = [];
+    preferredItemIds.forEach((itemId) => {
+      if (resultsByItemId.has(itemId) && !orderedItemIds.includes(itemId)) {
+        orderedItemIds.push(itemId);
+      }
+    });
+
+    [...resultsByItemId.values()]
+      .sort((left, right) => right.score - left.score)
+      .forEach((result) => {
+        if (!orderedItemIds.includes(result.item.id)) {
+          orderedItemIds.push(result.item.id);
+        }
+      });
+
+    return orderedItemIds
+      .slice(0, limit)
+      .map((itemId) => resultsByItemId.get(itemId))
+      .filter(Boolean);
+  }
+
+  function buildQueryMatchesFromPgResults(pgResults, limit = 5) {
+    return pgResults.slice(0, limit).map((result) => {
+      const score = Number(result.score) || 0;
+      const item = itemById(result.item_id) || {
+        id: result.item_id || result.source_id,
+        title: result.source_title,
+        source_type: result.source_type
+      };
+
+      return {
+        chunk: {
+          id: result.id,
+          chunk_index: result.chunk_index,
+          heading: result.heading,
+          text: result.text
+        },
+        item,
+        folderName: result.folder_name,
+        score,
+        contextChunks: [{
+          id: result.id,
+          chunk_index: result.chunk_index,
+          heading: result.heading,
+          text: result.text,
+          score
+        }]
+      };
+    });
+  }
+
+  function buildQueryAnswerSources(results) {
+    return results.map(({ item, folderName, score, contextChunks }) => {
+      const sourceChunks = contextChunks.length
+        ? contextChunks
+        : [{
+          chunk_index: 0,
+          heading: item.title || "Document",
+          text: item.raw_text || item.content_text || "",
+          score
+        }];
+
+      return {
+        item_id: item.id,
+        title: item.title || "Untitled",
+        source_type: item.source_type || item.type || "unknown",
+        folder_name: folderName || folderNameForItem(item.id),
+        score,
+        chunks: sourceChunks.map((chunk) => ({
+          chunk_index: chunk.chunk_index || 0,
+          heading: chunk.heading || "Document",
+          text: String(chunk.text || "").slice(0, 1200),
+          score: Number(chunk.score) || 0
+        }))
+      };
+    });
+  }
+
+  async function retrieveTopQueryMatches(queryEmbedding, limit = 5) {
+    const localRankedResults = rankLocalChunkMatches(queryEmbedding);
+    let uniquePgResults = [];
+
+    try {
+      const pgResults = await searchPgvector(queryEmbedding, 20);
+      const bestByItemId = new Map();
+      pgResults.forEach((result) => {
+        const itemId = result.item_id || result.source_id || "";
+        const score = Number(result.score) || 0;
+        const existing = itemId ? bestByItemId.get(itemId) : null;
+        if (!itemId) return;
+        if (!existing || score > (Number(existing.score) || 0)) {
+          bestByItemId.set(itemId, { ...result, score });
+        }
+      });
+      uniquePgResults = [...bestByItemId.values()]
+        .sort((left, right) => (Number(right.score) || 0) - (Number(left.score) || 0));
+
+      if (uniquePgResults.length) {
+        setVectorStatus("pgvector semantic search complete.");
+        setVectorError("");
+      } else {
+        setVectorStatus("");
+        setVectorError("");
+      }
+    } catch (error) {
+      setVectorStatus("");
+      setVectorError(`pgvector search skipped: ${error.message}`);
+    }
+
+    if (localRankedResults.length) {
+      const preferredItemIds = uniquePgResults.map((result) => result.item_id || result.source_id).filter(Boolean);
+      return buildQueryMatchesFromRankedChunks(localRankedResults, preferredItemIds, limit);
+    }
+
+    if (uniquePgResults.length) {
+      return buildQueryMatchesFromPgResults(uniquePgResults, limit);
+    }
+
+    return [];
   }
 
   function buildFolderProfileText(folder) {
@@ -1030,6 +1221,7 @@ export default function Home() {
     setSubmittedQuery(trimmedQuery);
     setQueryError("");
     setQueryResults([]);
+    setQueryAnswer("");
 
     if (!trimmedQuery) return;
 
@@ -1037,66 +1229,20 @@ export default function Home() {
     try {
       const payload = await createEmbeddings(trimmedQuery);
       const queryEmbedding = payload.embeddings[0];
-      try {
-        const pgResults = await searchPgvector(queryEmbedding, 20);
-        const bestByItemId = new Map();
-        pgResults.forEach((result) => {
-          const itemId = result.item_id || result.source_id || "";
-          const score = Number(result.score) || 0;
-          const existing = itemId ? bestByItemId.get(itemId) : null;
-          if (!itemId) return;
-          if (!existing || score > (Number(existing.score) || 0)) {
-            bestByItemId.set(itemId, { ...result, score });
-          }
-        });
-        const uniqueResults = [...bestByItemId.values()]
-          .sort((left, right) => (Number(right.score) || 0) - (Number(left.score) || 0))
-          .slice(0, 5);
+      const matches = await retrieveTopQueryMatches(queryEmbedding, 5);
+      setQueryResults(matches);
 
-        setQueryResults(
-          uniqueResults.map((result) => ({
-            chunk: result,
-            item: itemById(result.item_id) || {
-              id: result.item_id || result.source_id,
-              title: result.source_title,
-              source_type: result.source_type
-            },
-            folderName: result.folder_name,
-            score: Number(result.score) || 0
-          }))
-        );
-        setVectorStatus("pgvector semantic search complete.");
-        setVectorError("");
-        return;
-      } catch (error) {
-        setVectorStatus("");
-        setVectorError(`pgvector search skipped: ${error.message}`);
-      }
-
-      if (!embeddedChunks.length) {
-        setQueryError("No embedded files yet. Add and embed items from Manage first.");
+      if (!matches.length) {
+        setQueryError("No embedded chunks matched yet. Add and embed items from Manage first.");
         return;
       }
 
-      const rankedResults = embeddedChunks
-        .map((chunk) => ({
-          chunk,
-          item: itemById(chunk.item_id),
-          folderName: folderNameForItem(chunk.item_id),
-          score: cosineSimilarity(queryEmbedding, chunk.embedding)
-        }))
-        .filter((result) => result.item)
-        .sort((left, right) => right.score - left.score);
-
-      const bestByItemId = new Map();
-      rankedResults.forEach((result) => {
-        const itemId = result.item.id;
-        if (!bestByItemId.has(itemId)) {
-          bestByItemId.set(itemId, result);
-        }
+      const answer = await askLLMForQueryAnswer({
+        question: trimmedQuery,
+        sources: buildQueryAnswerSources(matches)
       });
 
-      setQueryResults([...bestByItemId.values()].slice(0, 5));
+      setQueryAnswer(answer.answer);
     } catch (error) {
       setQueryError(error.message || "Semantic search failed.");
     } finally {
@@ -1502,19 +1648,37 @@ export default function Home() {
           {queryError ? <p className="storage-error">{queryError}</p> : null}
           {hasQuery ? (
             <section className="query-result" aria-label="Query result">
-              <p className="eyebrow">Semantic retrieval</p>
-              <p>{querySearching ? "Searching embedded chunks..." : `Top matches for "${submittedQuery}"`}</p>
+              <p className="eyebrow">Answer</p>
+              <p>{querySearching ? "Retrieving the top files and drafting an answer..." : `Answer for "${submittedQuery}"`}</p>
+              <div className="answer-block">
+                {queryAnswer ? (
+                  <>
+                    <p className="answer-copy">{queryAnswer}</p>
+                    {topRelevantResult ? (
+                      <p className="muted-copy">
+                        Source File:{" "}
+                        <QuerySourceLink
+                          fileCopy={fileCopyForItem(topRelevantResult.item)}
+                          title={topRelevantResult.item.title}
+                        />
+                      </p>
+                    ) : null}
+                  </>
+                ) : (
+                  <p className="muted-copy">
+                    {querySearching ? "Building an answer from the most relevant files..." : "No answer available yet."}
+                  </p>
+                )}
+              </div>
               <div className="reference-block">
                 <h2>Relevant files</h2>
                 {queryResults.length ? (
                   <div className="reference-list">
-                    {queryResults.map(({ chunk, item, folderName, score }) => (
+                    {queryResults.map(({ chunk, item, folderName }) => (
                       <article className="reference-card" key={chunk.id}>
 	                        <div>
 	                          <h3>{item.title}</h3>
-	                          <p>
-	                            {folderName || folderNameForItem(item.id)} · {(score * 100).toFixed(1)}% match
-	                          </p>
+	                          <p>{folderName || folderNameForItem(item.id)}</p>
 	                          <p>{excerptForQuery(chunk.text, submittedQuery, 140)}</p>
 	                        </div>
 	                        <LocalFilePreview fileCopy={fileCopyForItem(item)} />
@@ -1830,7 +1994,7 @@ function ItemCard({ chunkCount, embeddedChunkCount, fileCopy, item, onRemove }) 
   );
 }
 
-function LocalFilePreview({ fileCopy }) {
+function LocalFilePreview({ className = "", fileCopy, label = "Open preview" }) {
   const [downloadUrl, setDownloadUrl] = useState("");
 
   useEffect(() => {
@@ -1847,10 +2011,23 @@ function LocalFilePreview({ fileCopy }) {
   if (!downloadUrl) return null;
 
   return (
-    <a className="preview-link" href={downloadUrl} rel="noreferrer" target="_blank">
-      Open preview
+    <a className={["preview-link", className].filter(Boolean).join(" ")} href={downloadUrl} rel="noreferrer" target="_blank">
+      {label}
     </a>
   );
+}
+
+function QuerySourceLink({ fileCopy, title }) {
+  const fallbackTitle = title || "Untitled";
+  const previewLink = (
+    <LocalFilePreview
+      className="source-file-link"
+      fileCopy={fileCopy}
+      label={fallbackTitle}
+    />
+  );
+
+  return previewLink || <span className="source-file-name">{fallbackTitle}</span>;
 }
 
 function ReviewCard({
