@@ -95,9 +95,20 @@ export async function POST(request) {
       return Response.json({ ok: false, error: "Question is required." }, { status: 400 });
     }
 
-    if (!sources.length) {
-      return Response.json({ ok: false, error: "At least one retrieved file is required." }, { status: 400 });
-    }
+    const usesSources = sources.length > 0;
+    const systemText = usesSources
+      ? [
+        "Answer the user's question using only the provided file contexts.",
+        "Do not invent facts beyond those contexts.",
+        "If the contexts are insufficient, say that clearly.",
+        "Keep the answer concise and directly useful.",
+        "Only include cited_item_ids that appear in the provided sources."
+      ].join(" ")
+      : [
+        "Answer the user's question using general knowledge.",
+        "Give a concise and directly useful answer.",
+        "Return an empty cited_item_ids array."
+      ].join(" ");
 
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -113,13 +124,7 @@ export async function POST(request) {
             content: [
               {
                 type: "input_text",
-                text: [
-                  "Answer the user's question using only the provided file contexts.",
-                  "Do not invent facts beyond those contexts.",
-                  "If the contexts are insufficient, say that clearly.",
-                  "Keep the answer concise and directly useful.",
-                  "Only include cited_item_ids that appear in the provided sources."
-                ].join(" ")
+                text: systemText
               }
             ]
           },
