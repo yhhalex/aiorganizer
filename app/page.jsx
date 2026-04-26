@@ -19,6 +19,7 @@ const EMBEDDING_MODEL = "text-embedding-3-small";
 const EMBEDDING_DIMENSIONS = 1536;
 const EMBEDDING_BATCH_SIZE = 64;
 const FOLDER_MATCH_THRESHOLD = 0.6;
+const QUERY_MATCH_THRESHOLD = 0.35;
 const LLM_DECISION_MODEL = "gpt-4o-mini";
 const LLM_QUERY_MODEL = "gpt-4o-mini";
 
@@ -415,6 +416,7 @@ export default function Home() {
   const [queryError, setQueryError] = useState("");
   const [querySearching, setQuerySearching] = useState(false);
   const [queryAnswer, setQueryAnswer] = useState("");
+  const [querySourceItemIds, setQuerySourceItemIds] = useState([]);
   const [embeddingStatus, setEmbeddingStatus] = useState("");
   const [embeddingError, setEmbeddingError] = useState("");
   const [embeddingSaving, setEmbeddingSaving] = useState(false);
@@ -539,6 +541,11 @@ export default function Home() {
     : [];
   const hasQuery = submittedQuery.trim().length > 0;
   const topRelevantResult = queryResults[0] || null;
+  const querySourceResults = querySourceItemIds.length
+    ? queryResults.filter(({ item }) => querySourceItemIds.includes(item.id))
+    : topRelevantResult
+      ? [topRelevantResult]
+      : [];
 
   function folderCount(folderId) {
     return data.folderItems.filter((row) => row.folder_id === folderId).length;
@@ -606,32 +613,34 @@ export default function Home() {
   function buildQueryMatchesFromRankedChunks(rankedResults, preferredItemIds = [], limit = 5) {
     const resultsByItemId = new Map();
 
-    rankedResults.forEach((result) => {
-      const itemId = result.item.id;
-      if (!resultsByItemId.has(itemId)) {
-        resultsByItemId.set(itemId, {
-          ...result,
-          contextChunks: [{
-            id: result.chunk.id,
-            chunk_index: result.chunk.chunk_index,
-            heading: result.chunk.heading,
-            text: result.chunk.text,
-            score: result.score
-          }]
-        });
-        return;
-      }
+    rankedResults
+      .filter((result) => result.score >= QUERY_MATCH_THRESHOLD)
+      .forEach((result) => {
+        const itemId = result.item.id;
+        if (!resultsByItemId.has(itemId)) {
+          resultsByItemId.set(itemId, {
+            ...result,
+            contextChunks: [{
+              id: result.chunk.id,
+              chunk_index: result.chunk.chunk_index,
+              heading: result.chunk.heading,
+              text: result.chunk.text,
+              score: result.score
+            }]
+          });
+          return;
+        }
 
-      const existing = resultsByItemId.get(itemId);
-      if (existing.contextChunks.length >= 3) return;
-      existing.contextChunks.push({
-        id: result.chunk.id,
-        chunk_index: result.chunk.chunk_index,
-        heading: result.chunk.heading,
-        text: result.chunk.text,
-        score: result.score
+        const existing = resultsByItemId.get(itemId);
+        if (existing.contextChunks.length >= 3) return;
+        existing.contextChunks.push({
+          id: result.chunk.id,
+          chunk_index: result.chunk.chunk_index,
+          heading: result.chunk.heading,
+          text: result.chunk.text,
+          score: result.score
+        });
       });
-    });
 
     const orderedItemIds = [];
     preferredItemIds.forEach((itemId) => {
@@ -655,33 +664,36 @@ export default function Home() {
   }
 
   function buildQueryMatchesFromPgResults(pgResults, limit = 5) {
-    return pgResults.slice(0, limit).map((result) => {
-      const score = Number(result.score) || 0;
-      const item = itemById(result.item_id) || {
-        id: result.item_id || result.source_id,
-        title: result.source_title,
-        source_type: result.source_type
-      };
+    return pgResults
+      .filter((result) => (Number(result.score) || 0) >= QUERY_MATCH_THRESHOLD)
+      .slice(0, limit)
+      .map((result) => {
+        const score = Number(result.score) || 0;
+        const item = itemById(result.item_id) || {
+          id: result.item_id || result.source_id,
+          title: result.source_title,
+          source_type: result.source_type
+        };
 
-      return {
-        chunk: {
-          id: result.id,
-          chunk_index: result.chunk_index,
-          heading: result.heading,
-          text: result.text
-        },
-        item,
-        folderName: result.folder_name,
-        score,
-        contextChunks: [{
-          id: result.id,
-          chunk_index: result.chunk_index,
-          heading: result.heading,
-          text: result.text,
-          score
-        }]
-      };
-    });
+        return {
+          chunk: {
+            id: result.id,
+            chunk_index: result.chunk_index,
+            heading: result.heading,
+            text: result.text
+          },
+          item,
+          folderName: result.folder_name,
+          score,
+          contextChunks: [{
+            id: result.id,
+            chunk_index: result.chunk_index,
+            heading: result.heading,
+            text: result.text,
+            score
+          }]
+        };
+      });
   }
 
   function buildQueryAnswerSources(results) {
@@ -744,7 +756,8 @@ export default function Home() {
 
     if (localRankedResults.length) {
       const preferredItemIds = uniquePgResults.map((result) => result.item_id || result.source_id).filter(Boolean);
-      return buildQueryMatchesFromRankedChunks(localRankedResults, preferredItemIds, limit);
+      const localMatches = buildQueryMatchesFromRankedChunks(localRankedResults, preferredItemIds, limit);
+      if (localMatches.length) return localMatches;
     }
 
     if (uniquePgResults.length) {
@@ -1222,6 +1235,7 @@ export default function Home() {
     setQueryError("");
     setQueryResults([]);
     setQueryAnswer("");
+    setQuerySourceItemIds([]);
 
     if (!trimmedQuery) return;
 
@@ -1232,17 +1246,13 @@ export default function Home() {
       const matches = await retrieveTopQueryMatches(queryEmbedding, 5);
       setQueryResults(matches);
 
-      if (!matches.length) {
-        setQueryError("No embedded chunks matched yet. Add and embed items from Manage first.");
-        return;
-      }
-
       const answer = await askLLMForQueryAnswer({
         question: trimmedQuery,
         sources: buildQueryAnswerSources(matches)
       });
 
       setQueryAnswer(answer.answer);
+      setQuerySourceItemIds(matches.length ? answer.citedItemIds : []);
     } catch (error) {
       setQueryError(error.message || "Semantic search failed.");
     } finally {
@@ -1654,13 +1664,18 @@ export default function Home() {
                 {queryAnswer ? (
                   <>
                     <p className="answer-copy">{queryAnswer}</p>
-                    {topRelevantResult ? (
+                    {querySourceResults.length ? (
                       <p className="muted-copy">
-                        Source File:{" "}
-                        <QuerySourceLink
-                          fileCopy={fileCopyForItem(topRelevantResult.item)}
-                          title={topRelevantResult.item.title}
-                        />
+                        Sources:{" "}
+                        {querySourceResults.map(({ item }, index) => (
+                          <span key={item.id}>
+                            {index > 0 ? ", " : ""}
+                            <QuerySourceLink
+                              fileCopy={fileCopyForItem(item)}
+                              title={item.title}
+                            />
+                          </span>
+                        ))}
                       </p>
                     ) : null}
                   </>
@@ -1670,27 +1685,27 @@ export default function Home() {
                   </p>
                 )}
               </div>
-              <div className="reference-block">
-                <h2>Relevant files</h2>
-                {queryResults.length ? (
-                  <div className="reference-list">
-                    {queryResults.map(({ chunk, item, folderName }) => (
-                      <article className="reference-card" key={chunk.id}>
-	                        <div>
-	                          <h3>{item.title}</h3>
-	                          <p>{folderName || folderNameForItem(item.id)}</p>
-	                          <p>{excerptForQuery(chunk.text, submittedQuery, 140)}</p>
-	                        </div>
-	                        <LocalFilePreview fileCopy={fileCopyForItem(item)} />
-	                      </article>
-	                    ))}
-                  </div>
-                ) : (
-                  <p className="muted-copy">
-                    {querySearching ? "Working..." : "No embedded chunks matched yet."}
-                  </p>
-                )}
-              </div>
+              {querySearching || queryResults.length ? (
+                <div className="reference-block">
+                  <h2>Relevant files</h2>
+                  {queryResults.length ? (
+                    <div className="reference-list">
+                      {queryResults.map(({ chunk, item, folderName }) => (
+                        <article className="reference-card" key={chunk.id}>
+                          <div>
+                            <h3>{item.title}</h3>
+                            <p>{folderName || folderNameForItem(item.id)}</p>
+                            <p>{excerptForQuery(chunk.text, submittedQuery, 140)}</p>
+                          </div>
+                          <LocalFilePreview fileCopy={fileCopyForItem(item)} />
+                        </article>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="muted-copy">Searching relevant files...</p>
+                  )}
+                </div>
+              ) : null}
             </section>
           ) : null}
         </section>
