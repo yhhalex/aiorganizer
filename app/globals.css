@@ -242,6 +242,46 @@ h3 {
   line-height: 1.6;
 }
 
+.answer-block {
+  display: grid;
+  gap: 10px;
+  margin-top: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+  background: var(--panel-raised);
+}
+
+.answer-copy {
+  color: var(--ink);
+  font-size: 15px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+}
+
+.source-file-link {
+  display: inline;
+  min-height: auto;
+  margin-top: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--accent-strong);
+  font-size: inherit;
+  font-weight: 800;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.source-file-link:hover {
+  background: transparent;
+  color: var(--accent);
+}
+
+.source-file-name {
+  color: var(--ink);
+}
+
 .reference-block {
   display: grid;
   gap: 10px;
